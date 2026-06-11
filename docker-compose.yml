@@ -24,6 +24,7 @@ services:
       - --http-port=8001
       - --grpc-port=8002
       - --metrics-port=8003
+      - --http-thread-count=16
     deploy:
       resources:
         reservations:

@@ -1,121 +1,86 @@
-# Context Carry — Nemotron 3.5 ASR Triton Stack
+# Context Carry — Nemotron 3.5 ASR Streaming on Triton
 
-## What This Is
-
-A production-grade streaming ASR deployment for **NVIDIA Nemotron 3.5 ASR Streaming 0.6B** using Triton Inference Server + FastAPI gateway. This replaces the earlier NIM-based approach which had streaming/gRPC bugs.
+## Project Identity
+- **Repo**: DastanZar/nemotron-triton-asr-v2 (fresh repo, no history)
+- **Branch**: main
+- **Deploy path on server**: /home/ubuntu/nemotron-triton/
+- **Server**: AWS EC2 (L40S GPU, 48GB VRAM)
+- **User accesses**: VS Code Remote-SSH from laptop
 
 ## Architecture
-
 ```
-Browser/Client → WebSocket → FastAPI Gateway (port 8000) → HTTP → Triton Server (port 8001)
-                                                      ↓
-                                              Python Backend (model.py)
-                                              NeMo ASR model on GPU
+Client (Python/WebSocket)  →  Gateway (FastAPI :8000)  →  Triton (Python backend :8001)
+                                ↑                               ↓
+                            dashboard.html              model_repository/nemotron_streaming/1/model.py
 ```
 
-### Two Services (Docker Compose)
-| Service | Container | Port | Role |
-|---|---|---|---|
-| **triton** | `nemotron-triton` | 8001 (HTTP), 8002 (gRPC), 8003 (metrics) | Inference server with NeMo Python backend |
-| **gateway** | `nemotron-gateway` | 8000 | FastAPI app: WebSocket + HTTP API + Dashboard |
+Two containers:
+- `nemotron-triton` — Triton 25.05 + NeMo from source, ports 8001/8002/8003
+- `nemotron-gateway` — Python 3.12 + FastAPI + tritonclient[http], port 8000
 
-### Key Files
+## Model
+- **Model**: nvidia/nemotron-3.5-asr-streaming-0.6b
+- **Att context size**: [56, 3] (56 frames left context, 3 frames right lookahead)
+- **Subsampling factor**: 8
+- **drop_extra_pre_encoded**: 2
+
+## Critical Fixes (model.py lines 208-234)
+- `drop_extra_pre_encoded=2` collapses feature frames to 0 for short sequences
+- **Fix**: Skip `drop_extra` for:
+  - First chunks (is_start=True)
+  - Last chunks (is_end=True)
+  - Any chunk with <20 frames after preprocessor
+- Added INFO logging for preprocessor output shapes and drop_extra decisions
+
+## Streaming Protocol (WebSocket /v1/stream)
+Client sends JSON per chunk:
+```json
+{"stream_id": "...", "target_lang": "auto", "sample_rate": 16000,
+ "encoding": "pcm_s16le", "is_start": true, "is_end": false,
+ "audio_b64": "<base64 pcm16>"}
 ```
-nemotron-triton/
-├── docker-compose.yml                     # Orchestrates both services
-├── deploy/
-│   ├── Dockerfile.triton                  # Triton 25.05 + NeMo from source
-│   └── Dockerfile.gateway                 # Python 3.12 + FastAPI
-├── model_repository/
-│   └── nemotron_streaming/
-│       ├── config.pbtxt                   # Triton model config (dynamic_batching)
-│       └── 1/model.py                     # Python backend: loads NeMo model, manages stream state
-├── gateway/
-│   ├── app.py                             # FastAPI: /v1/stream (WS), /v1/transcribe (POST), /v1/files, /healthz
-│   └── dashboard.html                     # Browser dashboard for FLEURS benchmarking
-├── client/
-│   └── concurrent_stream_client.py        # CLI client for concurrent WebSocket streaming
-├── test_audio/                            # FLEURS test clips
-│   ├── english/                           # 32 WAV files
-│   └── hindi/                             # 15 WAV files
-└── cache/hf/                              # HuggingFace model cache (persistent)
-```
-
-## How Triton Approach Differs from NIM
-
-| Aspect | NIM (old) | Triton (current) |
-|---|---|---|
-| Model serving | Black-box NIM container | Triton Python backend + NeMo |
-| Stream state | NIM internal, no control | `StreamState` dataclass with cache tensors |
-| Batching | Opaque | Triton `dynamic_batching` (preferred_batch_size: 4,8,16,32) |
-| API | gRPC streaming (buggy) | FastAPI WebSocket + HTTP |
-| Dependencies | NGC API key, TRT engines | NeMo from source, HuggingFace cache |
-| Dashboard | Custom nim_dashboard.html | FLEURS benchmark dashboard |
-
-## Model Details
-
-- **Model**: `nvidia/nemotron-3.5-asr-streaming-0.6b`
-- **att_context_size**: `[56,3]` (560ms chunks)
-- **STRIP_LANG_TAGS**: true
-- **MAX_SESSION_IDLE_SEC**: 900
-- **dynamic_batching**: max 64, preferred [4,8,16,32], 2ms queue delay
-
-## Server Info
-
-- **Current server**: 13.220.228.60 (AWS, L40S GPU, 48GB VRAM)
-- **Project path**: `/home/ubuntu/nemotron-triton/`
-- **Old project (untouched)**: `/home/ubuntu/nemotron-asr-benchmark/`
-- **GitHub PAT**: stored in `~/.netrc` or environment variable
-- **NGC API key**: stored in environment variable `NGC_API_KEY`
-
-## Dashboard Features
-
-- **Language picker**: English, Hindi, Auto-detect
-- **Concurrency slider**: 1-50 simultaneous streams
-- **Chunk size**: 80ms / 160ms / 320ms / 560ms
-- **File browser**: Lists all FLEURS test clips from server
-- **Select All / Deselect All / Select 1-N**: Quick file selection
-- **Real-time results**: Transcripts appear as they're processed
-- **Stats bar**: Done / Total / Errors / Avg Time
-- **Logs tab**: Full transcription progress
-
-## Known Issues
-
-1. **Browser cache**: Hard refresh (Ctrl+Shift+R) after any dashboard changes
-2. **WAV parsing**: Dashboard parses WAV headers manually (AudioContext.decodeAudioData is unreliable)
-3. **Port forwarding**: Use VS Code Ports tab to forward port 8000 for browser access
-
-## Commands
-
-```bash
-# Check status
-docker ps --format '{{.Names}} {{.Status}}'
-
-# Health check
-curl http://localhost:8000/healthz
-
-# View logs
-docker compose -f /home/ubuntu/nemotron-triton/docker-compose.yml logs -f
-
-# Restart
-docker compose -f /home/ubuntu/nemotron-triton/docker-compose.yml restart
-
-# Stop
-docker compose -f /home/ubuntu/nemotron-triton/docker-compose.yml down
-
-# Test transcription
-curl -X POST http://localhost:8000/v1/transcribe \
-  -F "file=@/home/ubuntu/nemotron-triton/test_audio/english/en_00.wav"
+Server responds per chunk:
+```json
+{"stream_id": "...", "text": "...", "is_final": false, "language": "en"}
 ```
 
-## What Was Done Today
+## Chunk Size Behavior
+| Chunk | English | Hindi |
+|-------|---------|-------|
+| 80ms  | Works | Empty text (model limitation) |
+| 160ms | Works | Works (minimum for Hindi) |
+| 320ms | Works | Works (default, best quality) |
 
-1. Cloned colleague's Triton-based ASR project from 54.158.0.249
-2. Analyzed architecture differences (Triton vs NIM)
-3. Deployed on current server in `/home/ubuntu/nemotron-triton/`
-4. Fixed NIM streaming bug (force_close thread) — now irrelevant, Triton approach works
-5. Built custom dashboard with FLEURS file browser and concurrency control
-6. Fixed WAV parsing bug (AudioContext → manual WAV header parser)
-7. Added `/v1/files` API endpoint for dashboard file listing
-8. Mounted test_audio directory into gateway container
-9. Pushed to GitHub as new repo
+## Performance (Hindi 160ms, 8 concurrent)
+- Per-stream RTF: 0.45–0.61 (all <1, fast)
+- Per-stream Speed: 1.63x–2.23x
+- Overall throughput: ~9.5x (8 streams)
+- Chunk latency p50: ~90ms, p95: ~150ms
+- TTFT: 447–1176ms (5-13 chunks of context needed)
+
+## Client Scripts
+1. `client/interactive_demo.py` — Live per-stream transcription view
+2. `client/metrics_demo.py` — Per-stream RTF/TTFT/TTBL/latency breakdown
+3. `client/benchmark.py` — Automated concurrency sweep (DO NOT MODIFY)
+
+## Key Files
+- `docker-compose.yml` — Service orchestration
+- `deploy/Dockerfile.triton` — Triton + NeMo from source build
+- `deploy/Dockerfile.gateway` — FastAPI gateway build
+- `gateway/app.py` — FastAPI routes, thread-local Triton clients
+- `gateway/dashboard.html` — Web dashboard with manual WAV parsing
+- `model_repository/nemotron_streaming/config.pbtxt` — Model config (dynamic batching, params)
+- `model_repository/nemotron_streaming/1/model.py` — Triton Python backend (core logic)
+
+## Important Decisions
+- **Thread-local Triton clients**: Single shared client serialized requests. Thread-local via `threading.local()` enables parallelism.
+- **CUDA graph decoder disabled**: `fused_batch_size=-1`, `use_cuda_graph_decoder=False` in model.py.
+- **No artificial sleep in metrics_demo**: Sends chunks back-to-back for true server processing measurement.
+- **RTF convention**: RTF = wall_time / audio_duration (< 1 = fast). Speed = audio_duration / wall_time (> 1 = fast).
+- **Dynamic batching**: pref [4, 8, 16, 32], max_queue_delay 2000μs.
+- **No secrets in git**: PAT stored in git remote URL, NGC key in env vars.
+
+## Test Audio
+- /home/ubuntu/nemotron-triton/test_audio/english/ — 32 English FLEURS WAV clips
+- /home/ubuntu/nemotron-triton/test_audio/hindi/ — 15 Hindi FLEURS WAV clips
+- To generate: run client/download_fleurs.py or copy from benchmark project

@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import io
 import json
 import os
+import threading
 import uuid
 from typing import Generator
 
@@ -21,9 +23,16 @@ TARGET_SR = 16000
 
 app = FastAPI(title="Nemotron ASR Gateway")
 
+_thread_local = threading.local()
+CONCURRENCY = int(os.environ.get("TRITON_CLIENT_CONCURRENCY", "32"))
 
-def _client() -> InferenceServerClient:
-    return InferenceServerClient(url=TRITON_URL)
+
+def _get_client() -> InferenceServerClient:
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        client = InferenceServerClient(url=TRITON_URL, concurrency=CONCURRENCY)
+        _thread_local.client = client
+    return client
 
 
 def _to_mono_float32(audio: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -41,7 +50,7 @@ def _iter_chunks(audio: np.ndarray, chunk_ms: int) -> Generator[np.ndarray, None
         yield audio[start : start + chunk_samples]
 
 
-def _infer_chunk(
+async def _infer_chunk_async(
     stream_id: str,
     chunk: np.ndarray,
     target_lang: str,
@@ -79,7 +88,12 @@ def _infer_chunk(
         InferRequestedOutput("IS_FINAL"),
         InferRequestedOutput("LANGUAGE"),
     ]
-    response = _client().infer(MODEL_NAME, infer_inputs, outputs=outputs)
+
+    def _sync_infer():
+        return _get_client().infer(MODEL_NAME, infer_inputs, outputs=outputs)
+
+    response = await asyncio.to_thread(_sync_infer)
+
     text = response.as_numpy("TRANSCRIPT").reshape(-1)[0]
     language = response.as_numpy("LANGUAGE").reshape(-1)[0]
     is_final_resp = bool(response.as_numpy("IS_FINAL").reshape(-1)[0])
@@ -125,7 +139,7 @@ def list_files():
 @app.get("/healthz")
 def healthz():
     try:
-        return {"ok": _client().is_server_live()}
+        return {"ok": _get_client().is_server_live()}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Triton unavailable: {exc}") from exc
 
@@ -144,7 +158,7 @@ async def transcribe(
     chunks = list(_iter_chunks(audio, chunk_ms))
     try:
         for index, chunk in enumerate(chunks):
-            last_result = _infer_chunk(
+            last_result = await _infer_chunk_async(
                 stream_id=stream_id,
                 chunk=chunk,
                 target_lang=target_lang,
@@ -179,7 +193,7 @@ async def stream(websocket: WebSocket):
 
             audio = _to_mono_float32(audio, sample_rate)
             try:
-                result = _infer_chunk(
+                result = await _infer_chunk_async(
                     stream_id=stream_id,
                     chunk=audio,
                     target_lang=target_lang,

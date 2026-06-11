@@ -158,7 +158,7 @@ async def stream_loop(stream_id, audio_path, target_lang, chunk_ms, iterations, 
 
 
 async def run(num_streams, num_iterations, chunk_ms, lang, server):
-    test_dir = Path("/home/ubuntu/nemotron-triton/test_audio")
+    test_dir = Path(__file__).parent.parent / "test_audio"
     if lang == "hi":
         files = sorted((test_dir / "hindi").glob("*.wav"))
     else:
